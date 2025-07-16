@@ -132,16 +132,16 @@ func New(client client.Client, opts ...Option) *Cache {
 		opt(&options)
 	}
 	c := &Cache{
-		client:               client,
-		assumedWorkloads:     make(map[workload.Reference]kueue.ClusterQueueReference),
-		resourceFlavors:      make(map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor),
-		admissionChecks:      make(map[kueue.AdmissionCheckReference]AdmissionCheck),
-		podsReadyTracking:    options.podsReadyTracking,
-		workloadInfoOptions:  options.workloadInfoOptions,
-		fairSharingEnabled:   options.fairSharingEnabled,
-		admissionFairSharing: options.admissionFairSharing,
-		hm:                   hierarchy.NewManager[*clusterQueue, *cohort](newCohort),
-		tasCache:             NewTASCache(client),
+		client:                   client,
+		assumedWorkloads:         make(map[workload.Reference]kueue.ClusterQueueReference),
+		resourceFlavors:          make(map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor),
+		admissionChecks:          make(map[kueue.AdmissionCheckReference]AdmissionCheck),
+		podsReadyTracking:        options.podsReadyTracking,
+		workloadInfoOptions:      options.workloadInfoOptions,
+		fairSharingEnabled:       options.fairSharingEnabled,
+		admissionFairSharing:     options.admissionFairSharing,
+		hm:                       hierarchy.NewManager[*clusterQueue, *cohort](newCohort),
+		tasCache:                 NewTASCache(client),
 		draDeviceClassToResource: make(map[corev1.ResourceName]corev1.ResourceName),
 	}
 	c.podsReadyCond.L = &c.RWMutex
@@ -162,6 +162,11 @@ func (c *Cache) newClusterQueue(log logr.Logger, cq *kueue.ClusterQueue) (*clust
 		AdmissionScope:      cq.Spec.AdmissionScope,
 
 		workloadsNotAccountedForTAS: sets.New[workload.Reference](),
+
+		// DRA resource claim tracking
+		draResourceClaims: make(map[DRAResourceClaimReference]*DRAResourceClaimUsage),
+		client:            c.client,
+		draLookup:         c.GetResourceNameForDeviceClass,
 	}
 	c.hm.AddClusterQueue(cqImpl)
 	c.hm.UpdateClusterQueueEdge(kueue.ClusterQueueReference(cq.Name), cq.Spec.Cohort)

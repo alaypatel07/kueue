@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/metrics"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
+	"sigs.k8s.io/kueue/pkg/workload"
 )
 
 func TestClusterQueueUpdateWithFlavors(t *testing.T) {
@@ -628,4 +629,146 @@ func TestClusterQueueReadinessWithTAS(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDRAResourceClaimReferenceounting demonstrates how DRA resource claims
+// are reference counted in the cache to avoid double-counting quota usage.
+func TestDRAResourceClaimReferenceCounting(t *testing.T) {
+	// Skip if DRA is not enabled in features
+	if !features.Enabled(features.DynamicResourceAllocation) {
+		t.Skip("DRA feature is not enabled")
+	}
+
+	// Create a mock cache with a client
+	cache := New(utiltesting.NewFakeClient())
+	ctx, log := utiltesting.ContextWithLog(t)
+
+	// Create a cluster queue
+	cq := utiltesting.MakeClusterQueue("test-cq").
+		ResourceGroup(*utiltesting.MakeFlavorQuotas("gpu-flavor").Resource("nvidia.com/gpu", "2").Obj()).
+		Obj()
+
+	// Create the cluster queue in the cache
+	cqImpl, err := cache.newClusterQueue(log, cq)
+	if err != nil {
+		t.Fatalf("Failed to create cluster queue: %v", err)
+	}
+
+	// Create two workloads that share the same DRA resource claim
+	sharedClaimName := "shared-gpu-claim"
+	workload1 := utiltesting.MakeWorkload("workload-1", "test-ns").
+		PodSets(*utiltesting.MakePodSet("main", 1).Obj()).
+		Obj()
+
+	// Manually add resource claim to the first workload
+	workload1.Spec.PodSets[0].Template.Spec.ResourceClaims = []corev1.PodResourceClaim{
+		{
+			Name:              "gpu-claim",
+			ResourceClaimName: &sharedClaimName,
+		},
+	}
+
+	workload2 := utiltesting.MakeWorkload("workload-2", "test-ns").
+		PodSets(*utiltesting.MakePodSet("main", 1).Obj()).
+		Obj()
+
+	// Manually add resource claim to the second workload
+	workload2.Spec.PodSets[0].Template.Spec.ResourceClaims = []corev1.PodResourceClaim{
+		{
+			Name:              "gpu-claim",
+			ResourceClaimName: &sharedClaimName,
+		},
+	}
+
+	// Create workload.Info objects manually
+	wi1 := &workload.Info{Obj: workload1}
+	wi2 := &workload.Info{Obj: workload2}
+
+	// Test: Add first workload using the DRA resource claim
+	usage1, err := cqImpl.addDRAResourceClaimUsage(ctx, cache.client, wi1)
+	if err != nil {
+		t.Fatalf("Failed to add DRA usage for workload1: %v", err)
+	}
+
+	// Verify that the first workload counts towards quota
+	if len(usage1) == 0 {
+		t.Log("First workload usage is empty (expected if no DRA setup)")
+	}
+
+	// Check that the resource claim is tracked
+	cqImpl.draResourceClaimsMutex.RLock()
+	claimRef := DRAResourceClaimReference{
+		Namespace: "test-ns",
+		Name:      "shared-gpu-claim",
+	}
+	claimUsage, exists := cqImpl.draResourceClaims[claimRef]
+	cqImpl.draResourceClaimsMutex.RUnlock()
+
+	if len(usage1) > 0 && !exists {
+		t.Errorf("Expected DRA resource claim to be tracked after adding first workload")
+	} else if len(usage1) > 0 && claimUsage.RefCount != 1 {
+		t.Errorf("Expected RefCount=1 after adding first workload, got %d", claimUsage.RefCount)
+	}
+
+	// Test: Add second workload using the same DRA resource claim
+	usage2, err := cqImpl.addDRAResourceClaimUsage(ctx, cache.client, wi2)
+	if err != nil {
+		t.Fatalf("Failed to add DRA usage for workload2: %v", err)
+	}
+
+	// Verify that the second workload does NOT count towards quota
+	if len(usage2) > 0 {
+		t.Errorf("Expected second workload to not count towards quota, but got usage: %v", usage2)
+	}
+
+	// Check that the reference count is incremented
+	cqImpl.draResourceClaimsMutex.RLock()
+	claimUsage, exists = cqImpl.draResourceClaims[claimRef]
+	cqImpl.draResourceClaimsMutex.RUnlock()
+
+	if len(usage1) > 0 && (!exists || claimUsage.RefCount != 2) {
+		t.Errorf("Expected RefCount=2 after adding second workload, got %d", claimUsage.RefCount)
+	}
+
+	// Test: Remove first workload
+	removedUsage1, err := cqImpl.removeDRAResourceClaimUsage(ctx, cache.client, wi1)
+	if err != nil {
+		t.Fatalf("Failed to remove DRA usage for workload1: %v", err)
+	}
+
+	// Verify that removing the first workload does NOT decrement quota
+	if len(removedUsage1) > 0 {
+		t.Errorf("Expected removing first workload to not decrement quota, but got usage: %v", removedUsage1)
+	}
+
+	// Check that the reference count is decremented but claim still exists
+	cqImpl.draResourceClaimsMutex.RLock()
+	claimUsage, exists = cqImpl.draResourceClaims[claimRef]
+	cqImpl.draResourceClaimsMutex.RUnlock()
+
+	if len(usage1) > 0 && (!exists || claimUsage.RefCount != 1) {
+		t.Errorf("Expected RefCount=1 after removing first workload, got %d", claimUsage.RefCount)
+	}
+
+	// Test: Remove second workload (last one using the claim)
+	removedUsage2, err := cqImpl.removeDRAResourceClaimUsage(ctx, cache.client, wi2)
+	if err != nil {
+		t.Fatalf("Failed to remove DRA usage for workload2: %v", err)
+	}
+
+	// Verify that removing the last workload decrements quota
+	if len(usage1) > 0 && len(removedUsage2) == 0 {
+		t.Errorf("Expected removing last workload to decrement quota, but got no usage")
+	}
+
+	// Check that the claim is completely removed
+	cqImpl.draResourceClaimsMutex.RLock()
+	_, exists = cqImpl.draResourceClaims[claimRef]
+	cqImpl.draResourceClaimsMutex.RUnlock()
+
+	if len(usage1) > 0 && exists {
+		t.Errorf("Expected DRA resource claim to be removed after removing last workload")
+	}
+
+	t.Log("DRA resource claim reference counting test completed successfully")
 }

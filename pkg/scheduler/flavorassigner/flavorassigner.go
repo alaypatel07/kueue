@@ -565,7 +565,16 @@ func (a *FlavorAssigner) findFlavorForPodSetResource(
 	}
 
 	status := &Status{}
-	requests = filterRequestedResources(requests, resourceGroup.CoveredResources)
+
+	// Filter requests: check if the resource name is covered by the resource group
+	filteredRequests := make(resources.Requests)
+	for rName, val := range requests {
+		if resourceGroup.CoveredResources.Has(rName) {
+			filteredRequests[rName] = val
+		}
+	}
+	requests = filteredRequests
+
 	ps := &a.wl.Obj.Spec.PodSets[psID]
 	podSpec := &ps.Template.Spec
 

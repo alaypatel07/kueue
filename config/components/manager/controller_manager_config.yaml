@@ -72,8 +72,9 @@ integrations:
 #    cpu: 0    # if you want to completely ignore cpu usage
 #    memory: 0 # ignore completely memory usage
 #    example.com/gpu: 100 # and you care only about GPUs usage
-#resources:
-#  excludeResourcePrefixes: []
+resources:
+  excludeResourcePrefixes: 
+  - "kueue-dra-shared-"
 #  transformations:
 #  - input: nvidia.com/mig-4g.5gb
 #    strategy: Replace | Retain

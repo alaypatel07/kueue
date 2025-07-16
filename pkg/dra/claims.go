@@ -19,114 +19,76 @@ package dra
 import (
 	"context"
 	"fmt"
-	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
 	resourcev1beta1 "k8s.io/api/resource/v1beta1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta1"
-	utilresource "sigs.k8s.io/kueue/pkg/util/resource"
 )
 
-// countDevicesPerClass returns a map[DeviceClass]→Quantity representing the
-// total number of devices requested for each DeviceClass inside the provided
-// ResourceClaimSpec.
-//
-// When structured-parameters are used (beta in k8s 1.32/1.33) **every entry**
-// in `spec.devices.requests` represents one device, so the quantity is the
-// sum of all `exactly` entries that reference the same DeviceClass.
-func countDevicesPerClass(claimSpec *resourcev1beta1.ResourceClaimSpec) map[corev1.ResourceName]resource.Quantity {
-	out := make(map[corev1.ResourceName]resource.Quantity)
-	if claimSpec == nil {
-		return out
-	}
-	for _, req := range claimSpec.Devices.Requests {
-		//if req. == nil {
-		//	// log a warning prioritized list is not supported
-		//	continue
-		//}
-		dc := corev1.ResourceName(req.DeviceClassName)
-		if dc == "" {
-			continue
-		}
-		var q int64
-		if req.AllocationMode == resourcev1beta1.DeviceAllocationModeExactCount {
-			q = req.Count
-		}
-		if existing, found := out[dc]; found {
-			existing.Add(resource.MustParse(strconv.FormatInt(q, 10)))
-			out[dc] = existing
-		} else {
-			out[dc] = resource.MustParse(strconv.FormatInt(q, 10))
-		}
-	}
-	return out
-}
+// GetResourceRequests returns the resource requests for a workload for DRA ResourceClaimTemplates and shared ResourceClaims.
+// The returned resourcelist is indexed by pod set name.
+func GetResourceRequests(ctx context.Context, c client.Client, wl *kueue.Workload, lookup func(dc corev1.ResourceName) (corev1.ResourceName, bool)) (map[kueue.PodSetReference]corev1.ResourceList, error) {
+	totalRequests := make(map[kueue.PodSetReference]corev1.ResourceList)
 
-// getClaimSpec resolves the ResourceClaim(Template) referenced by the PodResourceClaim
-// and returns its *ResourceClaimSpec. A nil spec and nil error mean the reference is
-// empty (both name pointers are nil) and should be skipped.
-func getClaimSpec(ctx context.Context, cl client.Client, namespace string, prc corev1.PodResourceClaim) (*resourcev1beta1.ResourceClaimSpec, error) {
-	switch {
-	case prc.ResourceClaimTemplateName != nil:
-		var tmpl resourcev1beta1.ResourceClaimTemplate
-		if err := cl.Get(ctx, client.ObjectKey{Namespace: namespace, Name: *prc.ResourceClaimTemplateName}, &tmpl); err != nil {
-			return nil, err
-		}
-		return &tmpl.Spec.Spec, nil
-	case prc.ResourceClaimName != nil:
-		var claim resourcev1beta1.ResourceClaim
-		if err := cl.Get(ctx, client.ObjectKey{Namespace: namespace, Name: *prc.ResourceClaimName}, &claim); err != nil {
-			return nil, err
-		}
-		return &claim.Spec, nil
-	default:
-		return nil, nil
-	}
-}
+	for _, ps := range wl.Spec.PodSets {
+		psRequests := make(corev1.ResourceList)
 
-// GetResourceRequests walks all ResourceClaims referenced by each PodSet of the Workload,
-// converts DeviceClass counts into logical resources using the provided lookup function and
-// returns the aggregated quantities per PodSet.
-//
-// If at least one DeviceClass is not present in the DynamicResourceAllocationConfig the function
-// returns an error.
-func GetResourceRequests(
-	ctx context.Context,
-	cl client.Client,
-	wl *kueue.Workload,
-	lookup func(dc corev1.ResourceName) (corev1.ResourceName, bool),
-) (map[kueue.PodSetReference]corev1.ResourceList, error) {
-	perPodSet := make(map[kueue.PodSetReference]corev1.ResourceList)
-	for i := range wl.Spec.PodSets {
-		ps := &wl.Spec.PodSets[i]
-		aggregated := corev1.ResourceList{}
-
-		// Resolve every ResourceClaim reference in the PodSet template.
-		for _, prc := range ps.Template.Spec.ResourceClaims {
-			spec, err := getClaimSpec(ctx, cl, wl.Namespace, prc)
-			if err != nil {
-				return nil, err
-			}
-			if spec == nil {
-				continue
-			}
-
-			for dc, qty := range countDevicesPerClass(spec) {
-				logical, found := lookup(dc)
-				if !found {
-					return nil, fmt.Errorf("DeviceClass %s is not mapped in DynamicResourceAllocationConfig", dc)
+		for _, rc := range ps.Template.Spec.ResourceClaims {
+			// Handle ResourceClaimTemplates
+			if rc.ResourceClaimTemplateName != nil {
+				templateName := *rc.ResourceClaimTemplateName
+				resourceClaimTemplate := &resourcev1beta1.ResourceClaimTemplate{}
+				if err := c.Get(ctx, types.NamespacedName{Name: templateName, Namespace: wl.Namespace}, resourceClaimTemplate); err != nil {
+					return nil, fmt.Errorf("failed to get ResourceClaimTemplate %s: %w", templateName, err)
 				}
-				aggregated = utilresource.MergeResourceListKeepSum(aggregated, corev1.ResourceList{logical: qty})
+
+				for _, req := range resourceClaimTemplate.Spec.Spec.Devices.Requests {
+					logicalResource, ok := lookup(corev1.ResourceName(req.DeviceClassName))
+					if !ok {
+						return nil, fmt.Errorf("failed to find logical resource mapping for device class: %s", req.DeviceClassName)
+					}
+
+					// Add to pod set requests (no prefix)
+					quantity := resource.MustParse(fmt.Sprintf("%d", req.Count))
+					if existing, exists := psRequests[logicalResource]; exists {
+						quantity.Add(existing)
+					}
+					psRequests[logicalResource] = quantity
+				}
+			}
+
+			// Handle shared ResourceClaims
+			if rc.ResourceClaimName != nil {
+				claimName := *rc.ResourceClaimName
+				resourceClaim := &resourcev1beta1.ResourceClaim{}
+				if err := c.Get(ctx, types.NamespacedName{Name: claimName, Namespace: wl.Namespace}, resourceClaim); err != nil {
+					return nil, fmt.Errorf("failed to get ResourceClaim %s: %w", claimName, err)
+				}
+
+				for _, req := range resourceClaim.Spec.Devices.Requests {
+					logicalResource, ok := lookup(corev1.ResourceName(req.DeviceClassName))
+					if !ok {
+						return nil, fmt.Errorf("failed to find logical resource mapping for device class: %s", req.DeviceClassName)
+					}
+
+					// Add to pod set requests (no prefix - canonical names)
+					quantity := resource.MustParse(fmt.Sprintf("%d", req.Count))
+					if existing, exists := psRequests[logicalResource]; exists {
+						quantity.Add(existing)
+					}
+					psRequests[logicalResource] = quantity
+				}
 			}
 		}
 
-		if len(aggregated) > 0 {
-			perPodSet[ps.Name] = aggregated
+		if len(psRequests) > 0 {
+			totalRequests[ps.Name] = psRequests
 		}
 	}
 
-	return perPodSet, nil
+	return totalRequests, nil
 }

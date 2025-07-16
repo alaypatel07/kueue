@@ -17,13 +17,16 @@ limitations under the License.
 package cache
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -32,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/ptr"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta1"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/hierarchy"
@@ -47,6 +51,19 @@ import (
 var (
 	errQueueAlreadyExists = errors.New("queue already exists")
 )
+
+// DRAResourceClaimReference uniquely identifies a DRA resource claim within a cluster queue
+type DRAResourceClaimReference struct {
+	Namespace string
+	Name      string
+}
+
+// DRAResourceClaimUsage tracks the usage of a DRA resource claim by multiple workloads
+type DRAResourceClaimUsage struct {
+	RefCount     int32
+	Usage        resources.FlavorResourceQuantities
+	WorkloadUIDs sets.Set[string]
+}
 
 // clusterQueue is the internal implementation of kueue.clusterQueue that
 // holds admitted workloads.
@@ -90,6 +107,12 @@ type clusterQueue struct {
 
 	workloadsNotAccountedForTAS sets.Set[workload.Reference]
 	AdmissionScope              *kueue.AdmissionScope
+
+	// DRA resource claim tracking
+	draResourceClaims      map[DRAResourceClaimReference]*DRAResourceClaimUsage
+	draResourceClaimsMutex sync.RWMutex
+	client                 client.Client
+	draLookup              func(corev1.ResourceName) (corev1.ResourceName, bool)
 }
 
 func (c *clusterQueue) GetName() kueue.ClusterQueueReference {
@@ -482,6 +505,26 @@ func (q *LocalQueue) reportActiveWorkloads() {
 func (c *clusterQueue) updateWorkloadUsage(log logr.Logger, wi *workload.Info, op usageOp) {
 	admitted := workload.IsAdmitted(wi.Obj)
 	frUsage := wi.FlavorResourceUsage()
+
+	// Handle DRA resource usage with reference counting
+	var draUsage resources.FlavorResourceQuantities
+	if features.Enabled(features.DynamicResourceAllocation) {
+		var err error
+		if op == add {
+			draUsage, err = c.addDRAResourceClaimUsage(context.Background(), c.client, wi)
+		} else {
+			draUsage, err = c.removeDRAResourceClaimUsage(context.Background(), c.client, wi)
+		}
+		if err != nil {
+			log.V(2).Info("Failed to handle DRA resource usage", "error", err)
+			// Continue without DRA usage tracking if there's an error
+			draUsage = make(resources.FlavorResourceQuantities)
+		}
+	} else {
+		draUsage = make(resources.FlavorResourceQuantities)
+	}
+
+	// Update regular resource usage
 	for fr, q := range frUsage {
 		if op == add {
 			addUsage(c, fr, q)
@@ -490,17 +533,31 @@ func (c *clusterQueue) updateWorkloadUsage(log logr.Logger, wi *workload.Info, o
 			removeUsage(c, fr, q)
 		}
 	}
+
+	// Update DRA resource usage
+	for fr, q := range draUsage {
+		if op == add {
+			addUsage(c, fr, q)
+		}
+		if op == subtract {
+			removeUsage(c, fr, q)
+		}
+	}
+
 	c.updateWorkloadTASUsage(log, wi, op)
 	if admitted {
 		updateFlavorUsage(frUsage, c.AdmittedUsage, op)
+		updateFlavorUsage(draUsage, c.AdmittedUsage, op)
 		c.admittedWorkloadsCount += op.asSignedOne()
 	}
 	qKey := queue.KeyFromWorkload(wi.Obj)
 	if lq, ok := c.localQueues[qKey]; ok {
 		updateFlavorUsage(frUsage, lq.totalReserved, op)
+		updateFlavorUsage(draUsage, lq.totalReserved, op)
 		lq.reservingWorkloads += op.asSignedOne()
 		if admitted {
 			lq.updateAdmittedUsage(frUsage, op)
+			lq.updateAdmittedUsage(draUsage, op)
 			lq.admittedWorkloads += op.asSignedOne()
 		}
 		if features.Enabled(features.LocalQueueMetrics) {
@@ -653,4 +710,130 @@ func (c *clusterQueue) flavorsForAdmissionCheck(ac kueue.AdmissionCheckReference
 		}
 	}
 	return flvs
+}
+
+// extractDRAResourceClaims extracts DRA resource claims from a workload
+func (c *clusterQueue) extractDRAResourceClaims(ctx context.Context, wl *kueue.Workload) (map[corev1.ResourceName]int64, error) {
+	usage := make(map[corev1.ResourceName]int64)
+
+	if wl.Status.Admission == nil {
+		return usage, nil
+	}
+
+	for _, podSetAssignment := range wl.Status.Admission.PodSetAssignments {
+		for resourceName, quantity := range podSetAssignment.ResourceUsage {
+			if _, isDRA := c.draLookup(resourceName); isDRA {
+				usage[resourceName] += quantity.Value()
+			}
+		}
+	}
+
+	return usage, nil
+}
+
+// getFirstAvailableFlavorForResource returns the first available flavor for a given resource
+// from the cluster queue's resource groups
+func (c *clusterQueue) getFirstAvailableFlavorForResource(resourceName corev1.ResourceName) kueue.ResourceFlavorReference {
+	for _, rg := range c.ResourceGroups {
+		if rg.CoveredResources.Has(resourceName) {
+			if len(rg.Flavors) > 0 {
+				return rg.Flavors[0]
+			}
+		}
+	}
+	return ""
+}
+
+// addDRAResourceClaimUsage adds DRA resource claim usage with reference counting
+// Returns the usage that should be added to quota (only for first workload using the claim)
+func (c *clusterQueue) addDRAResourceClaimUsage(ctx context.Context, cl client.Client, wi *workload.Info) (resources.FlavorResourceQuantities, error) {
+	c.draResourceClaimsMutex.Lock()
+	defer c.draResourceClaimsMutex.Unlock()
+
+	draUsage, err := c.extractDRAResourceClaims(ctx, wi.Obj)
+	if err != nil {
+		return nil, err
+	}
+
+	quotaUsage := make(resources.FlavorResourceQuantities)
+	workloadUID := string(wi.Obj.UID)
+
+	// Process each DRA resource from the workload
+	for resourceName, usageValue := range draUsage {
+		// For simplified implementation, we'll use the resource name as the claim reference
+		claimRef := DRAResourceClaimReference{
+			Namespace: wi.Obj.Namespace,
+			Name:      string(resourceName),
+		}
+
+		if claimUsage, exists := c.draResourceClaims[claimRef]; exists {
+			// Claim already exists, increment reference count
+			if !claimUsage.WorkloadUIDs.Has(workloadUID) {
+				claimUsage.RefCount++
+				claimUsage.WorkloadUIDs.Insert(workloadUID)
+			}
+		} else {
+			// First workload using this claim, count towards quota
+			flavorName := c.getFirstAvailableFlavorForResource(resourceName)
+			fr := resources.FlavorResource{Flavor: flavorName, Resource: resourceName}
+			quantity := *resource.NewQuantity(usageValue, resource.DecimalSI)
+			resourceUsage := resources.FlavorResourceQuantities{
+				fr: resources.ResourceValue(resourceName, quantity),
+			}
+
+			c.draResourceClaims[claimRef] = &DRAResourceClaimUsage{
+				RefCount:     1,
+				Usage:        resourceUsage,
+				WorkloadUIDs: sets.New(workloadUID),
+			}
+
+			// Add to quota usage
+			for fr, qty := range resourceUsage {
+				quotaUsage[fr] += qty
+			}
+		}
+	}
+
+	return quotaUsage, nil
+}
+
+// removeDRAResourceClaimUsage removes DRA resource claim usage with reference counting
+// Returns the usage that should be subtracted from quota (only for last workload using the claim)
+func (c *clusterQueue) removeDRAResourceClaimUsage(ctx context.Context, cl client.Client, wi *workload.Info) (resources.FlavorResourceQuantities, error) {
+	c.draResourceClaimsMutex.Lock()
+	defer c.draResourceClaimsMutex.Unlock()
+
+	draUsage, err := c.extractDRAResourceClaims(ctx, wi.Obj)
+	if err != nil {
+		return nil, err
+	}
+
+	quotaUsage := make(resources.FlavorResourceQuantities)
+	workloadUID := string(wi.Obj.UID)
+
+	for resourceName := range draUsage {
+		claimRef := DRAResourceClaimReference{
+			Namespace: wi.Obj.Namespace,
+			Name:      string(resourceName),
+		}
+
+		if claimUsage, exists := c.draResourceClaims[claimRef]; exists {
+			// Remove workload from the claim usage
+			if claimUsage.WorkloadUIDs.Has(workloadUID) {
+				claimUsage.RefCount--
+				claimUsage.WorkloadUIDs.Delete(workloadUID)
+
+				// If this was the last workload using the claim, remove from quota
+				if claimUsage.RefCount == 0 {
+					delete(c.draResourceClaims, claimRef)
+					// Add the claim's usage to quota usage (to be subtracted)
+					for fr, qty := range claimUsage.Usage {
+						quotaUsage[fr] += qty
+					}
+				}
+			}
+		}
+	}
+
+	return quotaUsage, nil
 }

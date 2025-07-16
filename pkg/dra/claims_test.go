@@ -110,7 +110,7 @@ func Test_GetResourceRequests(t *testing.T) {
 			want: map[kueuev1beta1.PodSetReference]corev1.ResourceList{
 				"main": {
 					"res-1": resource.MustParse("2"),
-					"res-2": resource.MustParse("1"),
+					"res-2": resource.MustParse("1"), // Now included without prefix because shared ResourceClaims are processed
 				},
 			},
 		},
@@ -188,6 +188,50 @@ func Test_GetResourceRequests(t *testing.T) {
 				return "", false
 			},
 			want: map[kueuev1beta1.PodSetReference]corev1.ResourceList{"main": {"res-1": resource.MustParse("2")}},
+		},
+		{
+			name: "ResourceClaimName is processed without prefix",
+			modifyWL: func(w *kueuev1beta1.Workload) {
+				w.Spec.PodSets[0].Template.Spec.ResourceClaims = []corev1.PodResourceClaim{
+					{Name: "req-2", ResourceClaimName: ptr.To("claim-2")}, // This should be processed without prefix
+				}
+			},
+			lookup: func(dc corev1.ResourceName) (corev1.ResourceName, bool) {
+				m := map[corev1.ResourceName]corev1.ResourceName{
+					"test-deviceclass-1": "res-1",
+					"test-deviceclass-2": "res-2",
+				}
+				lr, ok := m[dc]
+				return lr, ok
+			},
+			want: map[kueuev1beta1.PodSetReference]corev1.ResourceList{
+				"main": {
+					"res-2": resource.MustParse("1"), // Now processed without prefix
+				},
+			},
+		},
+		{
+			name: "Both ResourceClaimTemplate and shared ResourceClaim",
+			modifyWL: func(w *kueuev1beta1.Workload) {
+				w.Spec.PodSets[0].Template.Spec.ResourceClaims = []corev1.PodResourceClaim{
+					{Name: "req-1", ResourceClaimTemplateName: ptr.To("claim-tmpl-1")}, // Template - no prefix
+					{Name: "req-2", ResourceClaimName: ptr.To("claim-2")},              // Shared claim - no prefix
+				}
+			},
+			lookup: func(dc corev1.ResourceName) (corev1.ResourceName, bool) {
+				m := map[corev1.ResourceName]corev1.ResourceName{
+					"test-deviceclass-1": "res-1",
+					"test-deviceclass-2": "res-2",
+				}
+				lr, ok := m[dc]
+				return lr, ok
+			},
+			want: map[kueuev1beta1.PodSetReference]corev1.ResourceList{
+				"main": {
+					"res-1": resource.MustParse("2"), // Template - no prefix
+					"res-2": resource.MustParse("1"), // Shared claim - no prefix
+				},
+			},
 		},
 	}
 

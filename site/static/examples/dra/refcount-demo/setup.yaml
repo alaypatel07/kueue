@@ -1,0 +1,14 @@
+---
+# Shared ResourceClaim that will be used by two jobs
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaim
+metadata:
+  name: shared-gpu-claim
+  namespace: default
+spec:
+  devices:
+    requests:
+    - name: gpu
+      deviceClassName: gpu.example.com
+      allocationMode: ExactCount
+      count: 1 

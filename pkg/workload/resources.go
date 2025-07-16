@@ -185,6 +185,7 @@ func ValidateLimitRange(ctx context.Context, c client.Client, wi *Info) field.Er
 
 // AddDeviceClassesToContainerRequests augments the workload copy with logical
 // DRA resource requests so they get accounted by the quota engine.
+// Processes both ResourceClaimTemplates and shared ResourceClaims.
 // lookup converts DeviceClass → logical resource; caller can pass
 // cache.GetResourceNameForDeviceClass.
 func AddDeviceClassesToContainerRequests(ctx context.Context, cl client.Client, wl *kueue.Workload, lookup func(dc corev1.ResourceName) (corev1.ResourceName, bool)) error {
@@ -210,6 +211,6 @@ func AddDeviceClassesToContainerRequests(ctx context.Context, cl client.Client, 
 			res.Requests = utilresource.MergeResourceListKeepSum(res.Requests, rl)
 		}
 	}
-	log.V(4).Info("Injected DRA logical resources", "workload", wl.Name)
+	log.V(4).Info("Injected DRA logical resources from templates and shared claims", "workload", wl.Name)
 	return nil
 }
