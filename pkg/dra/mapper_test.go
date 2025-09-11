@@ -298,59 +298,11 @@ func TestCreateMapperFromConfiguration(t *testing.T) {
 	}
 
 	// Test that the global mapper was populated
-	resource, found := LookupResourceFor("foo.example.com")
+	resource, found := Mapper().lookup("foo.example.com")
 	if !found {
 		t.Error("Expected to find device class in global mapper")
 	}
 	if resource != "foo" {
 		t.Errorf("Expected resource 'foo', got '%s'", resource)
-	}
-}
-
-func TestLookupResourceFor(t *testing.T) {
-	// Initialize global mapper
-	config := &configapi.DynamicResourceAllocation{
-		Resources: []configapi.DynamicResource{
-			{
-				Name:             corev1.ResourceName("baz"),
-				DeviceClassNames: []corev1.ResourceName{"baz.example.com"},
-			},
-		},
-	}
-
-	err := CreateMapperFromConfiguration(config)
-	if err != nil {
-		t.Fatalf("CreateMapperFromConfiguration failed: %v", err)
-	}
-
-	tests := []struct {
-		deviceClass    corev1.ResourceName
-		expectedRes    corev1.ResourceName
-		expectedExists bool
-	}{
-		{
-			deviceClass:    "baz.example.com",
-			expectedRes:    "baz",
-			expectedExists: true,
-		},
-		{
-			deviceClass:    "example.com/nonexistent",
-			expectedRes:    "",
-			expectedExists: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(string(tt.deviceClass), func(t *testing.T) {
-			actualResource, actualExists := LookupResourceFor(tt.deviceClass)
-
-			if actualExists != tt.expectedExists {
-				t.Errorf("LookupResourceFor(%s) exists = %v, want %v", tt.deviceClass, actualExists, tt.expectedExists)
-			}
-
-			if actualResource != tt.expectedRes {
-				t.Errorf("LookupResourceFor(%s) resource = %v, want %v", tt.deviceClass, actualResource, tt.expectedRes)
-			}
-		})
 	}
 }

@@ -79,9 +79,3 @@ func Mapper() *ResourceMapper {
 func CreateMapperFromConfiguration(config *configapi.DynamicResourceAllocation) error {
 	return Mapper().populateFromConfiguration(config)
 }
-
-// LookupResourceFor performs a device class lookup using the global DRA mapper.
-// Returns the logical resource name and true if found, empty string and false otherwise.
-func LookupResourceFor(deviceClass corev1.ResourceName) (corev1.ResourceName, bool) {
-	return Mapper().lookup(deviceClass)
-}
